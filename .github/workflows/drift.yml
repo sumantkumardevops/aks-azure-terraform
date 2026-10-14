@@ -1,0 +1,80 @@
+name: drift-detection
+
+# Nightly `terraform plan -detailed-exitcode` per environment. A non-empty plan
+# (someone changed something in the portal, or a provider default moved) fails the run.
+#
+# Opt in after the first deployment by setting the repository variable
+# ENABLE_DRIFT_DETECTION = true, otherwise a never-deployed environment
+# would show up as "drift".
+
+on:
+  schedule:
+    - cron: "30 20 * * *" # 20:30 UTC = 02:00 IST
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: drift (${{ matrix.environment }})
+    if: vars.ENABLE_DRIFT_DETECTION == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=aks-platform/${{ matrix.environment }}.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Detect drift
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock=false -detailed-exitcode \
+            -var-file="envs/${{ matrix.environment }}.tfvars" | tee plan.txt
+          code=${PIPESTATUS[0]}
+          set -e
+
+          {
+            echo "### Drift check: ${{ matrix.environment }}"
+            if [ "$code" -eq 0 ]; then
+              echo "No drift detected."
+            elif [ "$code" -eq 2 ]; then
+              echo "Drift detected."
+              echo '```'
+              tail -c 60000 plan.txt
+              echo '```'
+            else
+              echo "Plan failed (exit code $code)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$code" -eq 2 ]; then
+            echo "::error::Drift detected in ${{ matrix.environment }}. See the job summary."
+            exit 1
+          fi
+          exit "$code"

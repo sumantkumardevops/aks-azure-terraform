@@ -1,0 +1,7 @@
+# Copy to backend.hcl (git-ignored) or let scripts/bootstrap-state.sh generate it.
+# The state key is supplied per environment, e.g.
+#   terraform init -backend-config=backends/backend.hcl -backend-config="key=aks-platform/dev.tfstate"
+resource_group_name  = "rg-tfstate-aksplat"
+storage_account_name = "tfstate0123456789ab"
+container_name       = "tfstate"
+use_azuread_auth     = true

@@ -1,0 +1,71 @@
+name: terraform-apply
+
+# Reusable workflow: plans and applies a single environment.
+# The job uses a GitHub Environment, so required reviewers and wait timers
+# configured on that environment gate the run before it starts.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment to deploy (dev, staging or prod)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: terraform apply (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: terraform-state-${{ inputs.environment }}
+      cancel-in-progress: false # never cancel an apply halfway
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=aks-platform/${{ inputs.environment }}.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color -lock-timeout=10m \
+            -var-file="envs/${{ inputs.environment }}.tfvars" \
+            -out=tfplan | tee plan.txt
+
+      - name: Terraform apply
+        run: terraform apply -input=false -lock-timeout=10m tfplan
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform apply: ${{ inputs.environment }}"
+            echo '```'
+            tail -c 60000 plan.txt 2>/dev/null || echo "No plan output."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

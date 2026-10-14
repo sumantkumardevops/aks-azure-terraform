@@ -1,0 +1,212 @@
+name: terraform
+
+# Pull request  -> validate, lint, scan, then `terraform plan` for every environment (posted as a PR comment)
+# Push to main  -> validate, then apply dev -> staging -> prod (each environment can require approval)
+# Manual run    -> validate, then plan + apply one chosen environment
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "envs/**"
+      - "modules/**"
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - "**.tf"
+      - "envs/**"
+      - "modules/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to plan and apply"
+        type: choice
+        options: [dev, staging, prod]
+        default: dev
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  validate:
+    name: fmt, validate, lint, scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: Terraform init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init
+          tflint --recursive
+
+      # Reports misconfigurations. Set exit-code to "1" to make HIGH/CRITICAL findings fail the build.
+      - name: Trivy IaC scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          format: table
+          exit-code: "0"
+
+  plan:
+    name: plan (${{ matrix.environment }})
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # GitHub OIDC -> Azure, no stored secrets
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="key=aks-platform/${{ matrix.environment }}.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+
+      - name: Terraform plan
+        id: plan
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var-file="envs/${{ matrix.environment }}.tfvars" | tee plan.txt
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform plan: ${{ matrix.environment }} (${{ steps.plan.outcome }})"
+            echo '```'
+            tail -c 60000 plan.txt 2>/dev/null || echo "No plan output."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment plan on the pull request
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          TF_ENV: ${{ matrix.environment }}
+          PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.TF_ENV;
+            const outcome = process.env.PLAN_OUTCOME;
+            let body = fs.existsSync('plan.txt') ? fs.readFileSync('plan.txt', 'utf8') : 'No plan output.';
+            if (body.length > 60000) {
+              body = '...(truncated)...\n' + body.slice(-60000);
+            }
+            const marker = `<!-- terraform-plan-${env} -->`;
+            const comment = [
+              marker,
+              `### Terraform plan: \`${env}\` (${outcome})`,
+              '<details><summary>Show plan</summary>',
+              '',
+              '```',
+              body,
+              '```',
+              '</details>',
+            ].join('\n');
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body: comment });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body: comment });
+            }
+
+  apply-dev:
+    name: apply dev
+    if: github.event_name == 'push'
+    needs: validate
+    uses: ./.github/workflows/apply.yml
+    with:
+      environment: dev
+    permissions:
+      id-token: write
+      contents: read
+
+  apply-staging:
+    name: apply staging
+    if: github.event_name == 'push'
+    needs: apply-dev
+    uses: ./.github/workflows/apply.yml
+    with:
+      environment: staging
+    permissions:
+      id-token: write
+      contents: read
+
+  apply-prod:
+    name: apply prod
+    if: github.event_name == 'push'
+    needs: apply-staging
+    uses: ./.github/workflows/apply.yml
+    with:
+      environment: prod
+    permissions:
+      id-token: write
+      contents: read
+
+  apply-manual:
+    name: apply ${{ inputs.environment }} (manual)
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    uses: ./.github/workflows/apply.yml
+    with:
+      environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
